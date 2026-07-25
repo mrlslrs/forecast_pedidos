@@ -1,0 +1,796 @@
+# %% [markdown]
+# # Pipeline de Vendas — ETL, Features, Lift e Clusterização
+# Dados e nomes de marca anonimizados. Ajuste `BASE_DIR` e `MAPA_BANDEIRAS`
+# para o seu ambiente antes de rodar.
+
+# %% Imports
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.graph_objects as go
+from pathlib import Path
+from datetime import datetime, timedelta
+from dateutil.easter import easter
+from sklearn.preprocessing import RobustScaler
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.decomposition import PCA
+
+sns.set_theme(style="whitegrid", palette="muted")
+
+# %% Configuração — caminhos e anonimização
+# Troque pelo caminho real no seu ambiente (ou use variável de ambiente DATA_DIR)
+BASE_DIR = Path(r"C:/dados/vendas")
+
+ARQ_PEDIDOS   = BASE_DIR / "vendas_diarias.csv"
+ARQ_SCORECARD = BASE_DIR / "status_lojas.xlsx"
+ARQ_DATAS     = BASE_DIR / "calendario_comercial.xlsx"
+ARQ_LOJAS_REMOVER = BASE_DIR / "lojas_fechadas.txt"  # um store_id por linha
+
+# Nomes de origem (como vêm da fonte) -> nome anonimizado final.
+# Tudo que passa por esse dicionário nunca aparece com o nome real no restante do código.
+MAPA_BANDEIRAS = {
+    "Atacadao": "Mercado A",
+    "Atacadão": "Mercado A",
+    "Cencosud Bretas": "Mercado B",
+    "Cencosud mercantil rodrigues": "Mercado C",
+}
+
+COLUNAS_SCORECARD = ["Store ID", "Região", "Modal", "Tier", "Status"]
+
+# %% Carregamento dos dados brutos
+df = pd.read_csv(ARQ_PEDIDOS, sep=",", encoding="utf-8")
+
+df_lojas_ativas = pd.read_excel(ARQ_SCORECARD)[COLUNAS_SCORECARD].copy()
+df_lojas_ativas["Store ID"] = df_lojas_ativas["Store ID"].astype(str).str.strip()
+df_lojas_ativas.drop_duplicates(subset=["Store ID"], inplace=True)
+for col in ["Modal", "Tier", "Status"]:
+    df_lojas_ativas[col] = df_lojas_ativas[col].astype(str).str.strip()
+
+# Lista de lojas fechadas a excluir (mantida em arquivo externo, não hardcoded)
+if ARQ_LOJAS_REMOVER.exists():
+    lojas_fechadas = (
+        ARQ_LOJAS_REMOVER.read_text(encoding="utf-8").splitlines()
+    )
+    lojas_fechadas = [x.strip() for x in lojas_fechadas if x.strip()]
+else:
+    lojas_fechadas = []
+
+# %% Seleção de colunas e merge com status de lojas
+COLS_PEDIDOS = [
+    "date", "brand_name", "brand_id_param", "store_id", "store_name",
+    "store_city", "store_state", "pedidos_total",
+    "slots_reservados", "slots_com_comparecimento",
+]
+df = df[COLS_PEDIDOS].copy()
+df["store_id"] = df["store_id"].astype(str).str.strip()
+df["store_name"] = df["store_name"].astype(str).str.strip()
+df["date"] = pd.to_datetime(df["date"])
+
+df_orders = df.merge(
+    df_lojas_ativas, left_on="store_id", right_on="Store ID", how="inner"
+)
+
+df_orders = (
+    df_orders.groupby(
+        ["date", "brand_name", "brand_id_param", "store_id", "store_name",
+         "store_city", "store_state", "Modal", "Tier", "Status"]
+    )
+    .agg(
+        pedidos_total=("pedidos_total", "sum"),
+        slots_reservados=("slots_reservados", "sum"),
+        slots_com_comparecimento=("slots_com_comparecimento", "sum"),
+    )
+    .reset_index()
+)
+
+# %% Anonimização de marca, remoção de lojas fechadas, exclusão de Delivery
+df_orders["brand_name"] = df_orders["brand_name"].replace(MAPA_BANDEIRAS)
+
+df_orders = df_orders[~df_orders["store_id"].isin(lojas_fechadas)]
+df_orders = df_orders[df_orders["Modal"] != "Delivery"].copy()
+
+# %% Calendário — dia útil / fim de semana
+df_orders["tipo_dia"] = np.where(
+    df_orders["date"].dt.dayofweek < 5, "Dia Útil", "Final de Semana"
+)
+
+# %% Geração de feriados e datas comerciais (script, não depende de planilha externa)
+anos = range(2024, datetime.today().year + 1)
+feriados = []
+
+for ano in anos:
+    feriados.extend([
+        (datetime(ano, 1, 1), "Confraternização Universal"),
+        (datetime(ano, 4, 21), "Tiradentes"),
+        (datetime(ano, 5, 1), "Dia do Trabalho"),
+        *[(datetime(ano, 6, d), "São João") for d in range(21, 26)],
+        (datetime(ano, 9, 7), "Independência do Brasil"),
+        (datetime(ano, 10, 12), "Nossa Senhora Aparecida"),
+        (datetime(ano, 11, 2), "Finados"),
+        (datetime(ano, 11, 15), "Proclamação da República"),
+        *[(datetime(ano, 12, d), "Festas de Fim de Ano / Ano Novo") for d in range(24, 32)],
+    ])
+    feriados += [(datetime(ano, 7, d), "Férias de Julho") for d in range(1, 10)]
+
+    pascoa = easter(ano)
+    feriados.append((pascoa, "Páscoa"))
+    carnaval = pascoa - timedelta(days=47)
+    feriados += [(carnaval, "Carnaval"), (carnaval + timedelta(days=1), "Carnaval")]
+
+    maio = pd.date_range(f"{ano}-05-01", f"{ano}-05-31", freq="D")
+    feriados.append((maio[maio.dayofweek == 6][1], "Dia das Mães"))
+
+    agosto = pd.date_range(f"{ano}-08-01", f"{ano}-08-31", freq="D")
+    feriados.append((agosto[agosto.dayofweek == 6][1], "Dia dos Pais"))
+
+    feriados.append((datetime(ano, 10, 12), "Dia das Crianças"))
+
+    novembro = pd.date_range(f"{ano}-11-01", f"{ano}-11-30", freq="D")
+    black_friday = novembro[novembro.dayofweek == 4][-1]
+    semana_black = pd.date_range(black_friday - timedelta(days=6), black_friday, freq="D")
+    feriados += [(d, "Período da Black Friday") for d in semana_black]
+
+    cyber_monday = black_friday + timedelta(days=3)
+    feriados += [(cyber_monday + timedelta(days=i), "Período da Black Friday") for i in range(4)]
+
+df_feriados = pd.DataFrame(feriados, columns=["date", "evento"])
+df_feriados["date"] = pd.to_datetime(df_feriados["date"])
+hoje = pd.Timestamp.today().normalize()
+df_feriados = df_feriados[df_feriados["date"] <= hoje].drop_duplicates().sort_values("date")
+
+df_feriados_dedup = (
+    df_feriados.groupby("date")["evento"]
+    .apply(lambda x: " | ".join(x.unique()))
+    .reset_index()
+)
+
+df_orders_total = df_orders.merge(df_feriados_dedup, on="date", how="left")
+
+# %% Colunas temporais
+DIAS_SEMANA = {0: "Segunda", 1: "Terça", 2: "Quarta", 3: "Quinta",
+                4: "Sexta", 5: "Sábado", 6: "Domingo"}
+
+df_orders_total["ano"] = df_orders_total["date"].dt.year
+df_orders_total["mês"] = df_orders_total["date"].dt.month
+df_orders_total["dia_da_semana"] = (
+    df_orders_total["date"].dt.dayofweek.map(DIAS_SEMANA).astype("category")
+)
+df_orders_total["semana_ano"] = df_orders_total["date"].dt.isocalendar().week
+df_orders_total["trimestre"] = df_orders_total["date"].dt.quarter
+
+# %% Dias de evento/campanha (janela de -4 a +2 dias ao redor de cada data especial)
+df_orders_total["tipo_data"] = "dia normal"
+datas_evento = df_orders_total.loc[df_orders_total["evento"].notna(), "date"]
+df_orders_total.loc[df_orders_total["evento"].notna(), "tipo_data"] = "campanha"
+
+for data_evento in datas_evento:
+    inicio, fim = data_evento - pd.Timedelta(days=4), data_evento + pd.Timedelta(days=2)
+    mascara = (
+        (df_orders_total["date"] >= inicio)
+        & (df_orders_total["date"] <= fim)
+        & (df_orders_total["date"] != data_evento)
+    )
+    df_orders_total.loc[mascara, "tipo_data"] = "campanha"
+
+# %% Dias até/desde o próximo evento
+datas_eventos = np.sort(df_orders_total.loc[df_orders_total["evento"].notna(), "date"].unique())
+
+def dias_para_proximo_evento(data):
+    futuros = datas_eventos[datas_eventos >= data]
+    return (data - datas_eventos[-1]).days if len(futuros) == 0 else (futuros[0] - data).days
+
+def dias_desde_ultimo_evento(data):
+    passados = datas_eventos[datas_eventos <= data]
+    if len(passados) == 0:
+        return (data - df_orders_total["date"].min()).days + 1
+    return (data - passados[-1]).days
+
+df_orders_total["dias_para_evento"] = df_orders_total["date"].apply(dias_para_proximo_evento)
+df_orders_total["dias_desde_evento"] = df_orders_total["date"].apply(dias_desde_ultimo_evento)
+df_orders_total["evento"] = df_orders_total["evento"].fillna("dia normal")
+
+# %% Função — classificação IQR (outliers por dia útil/fim de semana)
+def calcular_classificacao_iqr(
+    df, col_valor="pedidos_total", col_tipo_dia="tipo_dia",
+    col_grupo=("store_id", "ano"), label_du="Dia Útil", label_fds="Final de Semana",
+    fator_iqr=1.5,
+):
+    col_grupo = list(col_grupo)
+    df = df.copy()
+
+    def _quartis(tipo, sufixo):
+        q = (
+            df[df[col_tipo_dia] == tipo]
+            .groupby(col_grupo)[col_valor]
+            .quantile([0.25, 0.50, 0.75])
+            .unstack()
+            .reset_index()
+        )
+        q.columns = col_grupo + [f"Q1{sufixo}", f"Q2{sufixo}", f"Q3{sufixo}"]
+        return q
+
+    quartis = _quartis(label_du, "DU").merge(_quartis(label_fds, "FDS"), on=col_grupo, how="outer")
+    df = df.merge(quartis, on=col_grupo, how="left")
+
+    for sufixo in ("DU", "FDS"):
+        q1, q3 = f"Q1{sufixo}", f"Q3{sufixo}"
+        df[f"IQR{sufixo}"] = df[q3] - df[q1]
+        df[f"LI_{sufixo}"] = df[q1] - fator_iqr * df[f"IQR{sufixo}"]
+        df[f"LS_{sufixo}"] = df[q3] + fator_iqr * df[f"IQR{sufixo}"]
+
+    sufixo_por_linha = np.where(df[col_tipo_dia] == label_du, "DU", "FDS")
+    li = np.where(sufixo_por_linha == "DU", df["LI_DU"], df["LI_FDS"])
+    ls = np.where(sufixo_por_linha == "DU", df["LS_DU"], df["LS_FDS"])
+    fora = (df[col_valor] < li) | (df[col_valor] > ls)
+    df["classificacao_iqr"] = np.where(fora, "Outlier", "Inlier")
+
+    return df
+
+df_orders_total = calcular_classificacao_iqr(df_orders_total)
+
+# %% Funções — lags, médias móveis e volatilidade
+def calcular_lags(df, col_valor="pedidos_total", col_grupo="store_id",
+                   col_data="date", lags=(1, 7, 14, 21, 28)):
+    df = df.sort_values([col_grupo, col_data]).copy()
+    for lag in lags:
+        df[f"lag_{lag}"] = df.groupby(col_grupo)[col_valor].shift(lag)
+    return df
+
+def calcular_medias_moveis(df, col_valor="pedidos_total", col_grupo="store_id",
+                            col_data="date", janelas=(7, 14, 21, 28), shift=1, decimais=2):
+    df = df.sort_values([col_grupo, col_data]).copy()
+    for j in janelas:
+        df[f"mm{j}"] = (
+            df.groupby(col_grupo)[col_valor]
+            .transform(lambda x, j=j: x.shift(shift).rolling(j).mean().round(decimais))
+        )
+    return df
+
+def calcular_volatilidade(df, col_valor="pedidos_total", col_grupo="store_id",
+                           col_data="date", janelas=(7, 14, 21, 28), shift=1, decimais=2):
+    df = df.sort_values([col_grupo, col_data]).copy()
+    for j in janelas:
+        df[f"std{j}"] = (
+            df.groupby(col_grupo)[col_valor]
+            .transform(lambda x, j=j: x.shift(shift).rolling(j).std().round(decimais))
+        )
+    return df
+
+df_orders_total = calcular_lags(df_orders_total)
+df_orders_total = calcular_medias_moveis(df_orders_total)
+df_orders_total = calcular_volatilidade(df_orders_total)
+
+# %% Flag de outlier considerando campanha
+df_orders_total["is_outlier"] = (df_orders_total["classificacao_iqr"] != "Inlier").astype(int)
+df_orders_total.loc[
+    (df_orders_total["tipo_data"] == "campanha") & (df_orders_total["classificacao_iqr"] == "Outlier"),
+    "is_outlier",
+] = 1
+
+# %% Taxas de reserva e comparecimento
+df_orders_total["taxa_comparecimento"] = np.where(
+    df_orders_total["slots_reservados"] > 0,
+    df_orders_total["slots_com_comparecimento"] / df_orders_total["slots_reservados"],
+    np.nan,
+)
+df_orders_total["taxa_reserva"] = np.where(
+    df_orders_total["slots_reservados"] > 0,
+    df_orders_total["pedidos_total"] / df_orders_total["slots_reservados"],
+    np.nan,
+)
+
+# %% Normalização de UF
+MAPA_UF = {
+    "Alagoas": "AL", "Bahia": "BA", "Goias": "GO", "Paraiba": "PB",
+    "Parana": "PR", "Rio de Janeiro": "RJ", "Rio Grande do Sul": "RS",
+    "São Paulo": "SP", "Sao Paulo": "SP",
+}
+df_orders_total["store_state"] = df_orders_total["store_state"].str.replace("BR-", "", regex=False)
+for origem, sigla in MAPA_UF.items():
+    df_orders_total["store_state"] = df_orders_total["store_state"].str.replace(origem, sigla, regex=False)
+
+df_orders_total["store_city"] = df_orders_total["store_city"].str.title()
+df_orders_total["brand_name"] = df_orders_total["brand_name"].str.strip().str.title()
+
+# %% Preenchimento de nulos (lags, médias móveis, volatilidade, taxas) por mediana móvel escalonada
+cols_mm = ["mm7", "mm14", "mm21", "mm28"]
+cols_lag_only = ["lag_1", "lag_7", "lag_14", "lag_21", "lag_28"]
+cols_std = ["std7", "std14", "std21", "std28"]
+cols_taxas = ["taxa_comparecimento", "taxa_reserva"]
+cols_all = cols_lag_only + cols_mm + cols_std + cols_taxas
+
+def fill_nulls(x):
+    result = x.copy()
+    for w in [3, 5, 7, 10, 14, 21, 28, 35, 45, 60, 75, 90]:
+        result = result.fillna(result.rolling(window=w, min_periods=1).median())
+    return result
+
+for col in cols_all:
+    df_orders_total[col] = df_orders_total.groupby("store_id")[col].transform(fill_nulls)
+
+for col in cols_all:
+    mask = df_orders_total[col].isnull()
+    if mask.any():
+        df_orders_total.loc[mask, col] = (
+            df_orders_total.groupby("brand_name")[col].transform(fill_nulls).loc[mask]
+        )
+
+for col in cols_all:
+    mask = df_orders_total[col].isnull()
+    if mask.any():
+        df_orders_total.loc[mask, col] = df_orders_total[col].median()
+
+for col in cols_mm + cols_lag_only:
+    mask_invalido = df_orders_total[col].isnull() | (df_orders_total[col] == 0)
+    df_orders_total.loc[mask_invalido, col] = df_orders_total.loc[mask_invalido, "pedidos_total"]
+
+for col in cols_std + cols_taxas:
+    df_orders_total[col] = df_orders_total[col].fillna(0)
+
+# %% Momentum de curto vs. longo prazo (vetorizado — sem groupby desnecessário)
+def status_momentum(mm_curta, mm_longa, momentum):
+    if mm_longa == 0 and mm_curta > 0:
+        return "Novo Crescimento"
+    if mm_longa == 0 and mm_curta == 0:
+        return "Sem Movimento"
+    if momentum > 1.05:
+        return "Crescimento"
+    if momentum < 0.95:
+        return "Queda"
+    return "Estável"
+
+df_orders_total["momentum_7_21"] = (
+    df_orders_total["mm7"] / df_orders_total["mm21"].replace(0, np.nan)
+).round(2)
+df_orders_total["status_momentum_7_21"] = df_orders_total.apply(
+    lambda r: status_momentum(r["mm7"], r["mm21"], r["momentum_7_21"]), axis=1
+)
+
+df_orders_total["momentum_7_28"] = (
+    df_orders_total["mm7"] / df_orders_total["mm28"].replace(0, np.nan)
+).round(2)
+df_orders_total["status_momentum_7_28"] = df_orders_total.apply(
+    lambda r: status_momentum(r["mm7"], r["mm28"], r["momentum_7_28"]), axis=1
+)
+
+df_orders_total["coef_var"] = (
+    df_orders_total["std7"] / df_orders_total["mm7"].replace(0, np.nan)
+).round(4)
+
+# %% Ciclo de vida da loja (nova / ativa / encerrada)
+HOJE = df_orders_total["date"].max()
+LIMIAR_DIAS = 10
+
+store_lifecycle = (
+    df_orders_total.groupby("store_id")
+    .agg(data_inicio=("date", "min"), data_fim=("date", "max"), dias_com_dados=("date", "nunique"))
+    .reset_index()
+    .assign(
+        dias_operacao=lambda d: (d["data_fim"] - d["data_inicio"]).dt.days + 1,
+        cobertura=lambda d: d["dias_com_dados"] / d["dias_operacao"],
+        status_loja=lambda d: np.select(
+            [d["data_inicio"] > HOJE - pd.Timedelta(days=LIMIAR_DIAS),
+             d["data_fim"] < HOJE - pd.Timedelta(days=LIMIAR_DIAS)],
+            ["nova", "encerrada"],
+            default="ativa",
+        ),
+    )
+)
+
+df_orders_total = df_orders_total.merge(
+    store_lifecycle[["store_id", "status_loja"]], on="store_id", how="left"
+)
+
+# %% Proxy de porte de loja (volume mediano de pedidos)
+porte = (
+    df_orders_total.groupby("store_id")["pedidos_total"]
+    .median()
+    .rename("volume_mediano")
+    .reset_index()
+)
+porte["porte"] = pd.qcut(porte["volume_mediano"], q=3, labels=["pequena", "média", "grande"])
+
+df_orders_total = df_orders_total.merge(porte[["store_id", "porte"]], on="store_id", how="left")
+df_orders_total["porte"] = df_orders_total["porte"].astype(str)
+df_orders_total["dia_da_semana"] = df_orders_total["dia_da_semana"].astype(str)
+
+# Remove outliers da base principal (mantidos apenas para diagnóstico, se precisar)
+df_outliers_removidos = df_orders_total[df_orders_total["is_outlier"] == 1].copy()
+df_orders_total = df_orders_total[df_orders_total["is_outlier"] == 0].reset_index(drop=True)
+
+# %% Reordenação de colunas
+df_orders_total = df_orders_total[[
+    "date", "brand_id_param", "brand_name", "store_id", "store_name", "store_city",
+    "store_state", "Modal", "Tier", "Status", "pedidos_total", "slots_reservados",
+    "slots_com_comparecimento", "dia_da_semana", "semana_ano", "mês", "trimestre", "ano",
+    "tipo_dia", "tipo_data", "evento", "dias_para_evento", "dias_desde_evento",
+    "Q1DU", "Q2DU", "Q3DU", "Q1FDS", "Q2FDS", "Q3FDS", "IQRDU", "LI_DU", "LS_DU",
+    "IQRFDS", "LI_FDS", "LS_FDS", "classificacao_iqr", "lag_1", "lag_7", "lag_14",
+    "lag_21", "lag_28", "mm7", "mm14", "mm21", "mm28", "std7", "std14", "std21", "std28",
+    "is_outlier", "taxa_comparecimento", "taxa_reserva", "momentum_7_21",
+    "status_momentum_7_21", "momentum_7_28", "status_momentum_7_28", "porte", "coef_var",
+    "status_loja",
+]]
+
+# %% Lift — impacto de eventos/campanhas sobre o volume de pedidos
+JANELA_BASELINE_NORMAL = 28
+JANELAS_FALLBACK_EVENTO = [14, 21, 28, 42, 56, 90, 180, 365]
+JANELAS_SEM_OPERACAO = [7, 14, 21, 28]
+MIN_DIAS_BASELINE = 3
+ROTULO_DIA_NORMAL = "dia normal"
+
+def _classificar_zeros(df_store):
+    tem_pedido = df_store["pedidos_total"] > 0
+    tem_slot = df_store["slots_reservados"] > 0
+    tipo = pd.Series("operação normal", index=df_store.index)
+    tipo[~tem_pedido & tem_slot] = "zero operacional"
+    tipo[~tem_pedido & ~tem_slot] = "zero real"
+    return tipo
+
+def _identificar_blocos_evento(df_store, mask_evento):
+    if not mask_evento.any():
+        return pd.DataFrame(columns=["idx_inicio", "idx_fim", "evento"])
+
+    evento, data = df_store["evento"], df_store["date"]
+    novo_bloco = mask_evento & (
+        ~mask_evento.shift(1, fill_value=False)
+        | (evento != evento.shift(1))
+        | (data.diff().dt.days != 1)
+    )
+    bloco_id = novo_bloco.cumsum().where(mask_evento)
+
+    return (
+        df_store.loc[mask_evento]
+        .assign(_bloco_id=bloco_id[mask_evento])
+        .groupby("_bloco_id")
+        .apply(lambda g: pd.Series({
+            "idx_inicio": g.index.min(), "idx_fim": g.index.max(), "evento": g["evento"].iloc[0],
+        }), include_groups=False)
+        .reset_index(drop=True)
+    )
+
+def _calcular_baseline_normal(df_store, mask_baseline):
+    pedidos_normais = df_store["pedidos_baseline"].where(mask_baseline)
+    return pedidos_normais.shift(1).rolling(window=JANELA_BASELINE_NORMAL, min_periods=1).mean()
+
+def _baseline_para_bloco(df_store, mask_baseline, idx_inicio):
+    data_inicio = df_store.loc[idx_inicio, "date"]
+    antes = mask_baseline & (df_store["date"] < data_inicio)
+
+    for dias in JANELAS_FALLBACK_EVENTO:
+        na_janela = antes & (df_store["date"] >= data_inicio - pd.Timedelta(days=dias))
+        validos = na_janela & df_store["pedidos_baseline"].notna()
+        if validos.sum() >= MIN_DIAS_BASELINE:
+            return df_store.loc[validos, "pedidos_baseline"].mean()
+
+    validos_total = antes & df_store["pedidos_baseline"].notna()
+    if validos_total.sum() >= 1:
+        return df_store.loc[validos_total, "pedidos_baseline"].mean()
+
+    if idx_inicio > df_store.index.min():
+        return df_store.loc[idx_inicio - 1, "baseline_lift"]
+    return np.nan
+
+def _features_sem_operacao(df_store):
+    df_store["operou_hoje"] = (df_store["pedidos_total"] > 0).astype(int)
+    eh_zero_real = (df_store["tipo_zero"] == "zero real").astype(float)
+    for janela in JANELAS_SEM_OPERACAO:
+        df_store[f"pct_sem_operacao_{janela}"] = (
+            eh_zero_real.shift(1).rolling(window=janela, min_periods=1).mean().round(4)
+        )
+    return df_store
+
+def processar_loja(df_store):
+    df_store = df_store.sort_values("date").reset_index(drop=True)
+    mask_baseline = df_store["tipo_data"] == "dia normal"
+    mask_evento = df_store["evento"] != ROTULO_DIA_NORMAL
+
+    df_store["tipo_zero"] = _classificar_zeros(df_store)
+    df_store["pedidos_baseline"] = df_store["pedidos_total"].astype(float)
+    df_store.loc[df_store["tipo_zero"] == "zero operacional", "pedidos_baseline"] = np.nan
+
+    df_store["baseline_lift"] = _calcular_baseline_normal(df_store, mask_baseline)
+
+    for _, bloco in _identificar_blocos_evento(df_store, mask_evento).iterrows():
+        idx_inicio, idx_fim = int(bloco["idx_inicio"]), int(bloco["idx_fim"])
+        indices = df_store.index[(df_store.index >= idx_inicio) & (df_store.index <= idx_fim)]
+
+        baseline = _baseline_para_bloco(df_store, mask_baseline, idx_inicio)
+        df_store.loc[indices, "baseline_lift"] = baseline
+
+        media_evento = df_store.loc[indices, "pedidos_total"].mean()
+        lift_medio = (
+            round((media_evento - baseline) / baseline * 100, 2)
+            if pd.notna(baseline) and baseline != 0 else np.nan
+        )
+        df_store.loc[indices, "media_evento"] = round(media_evento, 2)
+        df_store.loc[indices, "lift_medio_evento_pct"] = lift_medio
+
+    df_store["baseline_lift"] = df_store["baseline_lift"].round(2)
+    baseline_ok = df_store["baseline_lift"].notna() & (df_store["baseline_lift"] != 0)
+    df_store["baseline_invalida"] = (~baseline_ok).astype(int)
+    df_store["lift_incremental_pct"] = np.where(
+        baseline_ok,
+        (df_store["pedidos_total"] - df_store["baseline_lift"]) / df_store["baseline_lift"] * 100,
+        np.nan,
+    ).round(2)
+
+    return _features_sem_operacao(df_store).drop(columns=["pedidos_baseline"])
+
+def calcular_lift(df):
+    df = df.sort_values(["store_id", "date"]).reset_index(drop=True)
+    return pd.concat(
+        [processar_loja(g).assign(store_id=sid) for sid, g in df.groupby("store_id")],
+        ignore_index=True,
+    )
+
+df_orders_total = calcular_lift(df_orders_total)
+
+for col in ["mm21", "taxa_reserva", "momentum_7_21", "momentum_7_28", "coef_var"]:
+    df_orders_total[col] = df_orders_total[col].round(4)
+
+df_orders_total["brand_name"] = df_orders_total["brand_name"].str.capitalize()
+
+print(f"df_orders_total: {df_orders_total.shape[0]:,} linhas × {df_orders_total.shape[1]} colunas")
+
+# %% Crescimento semanal e idade da loja
+df_orders_total["growth_7_28_pct"] = (
+    (df_orders_total["lag_7"] - df_orders_total["lag_28"]) / df_orders_total["lag_28"] * 100
+).round(2)
+
+data_abertura = df_orders_total.groupby("store_id")["date"].min()
+df_orders_total["idade_loja_dias"] = (
+    df_orders_total["date"] - df_orders_total["store_id"].map(data_abertura)
+).dt.days
+
+# %% Sazonalidade mensal por loja
+sazonalidade_loja = (
+    df_orders_total.groupby(["store_id", "store_name", "mês"])
+    .agg(pedidos_medio_sazon=("pedidos_total", "mean"))
+    .round(2)
+    .reset_index()
+)
+df_orders_total = df_orders_total.merge(
+    sazonalidade_loja, on=["store_id", "store_name", "mês"], how="left"
+)
+
+# %% [markdown]
+# ## Qualidade dos dados (checagens rápidas, não descritivo/didático)
+
+# %% Duplicados, nulos, cobertura de datas e diagnóstico de outliers
+print(f"Linhas duplicadas: {df_orders_total.duplicated().sum():,}")
+
+missing_report = (
+    pd.DataFrame({
+        "coluna": df_orders_total.columns,
+        "qtd_nulos": df_orders_total.isna().sum().values,
+        "pct_nulos": (df_orders_total.isna().mean() * 100).round(2).values,
+    })
+    .sort_values("pct_nulos", ascending=False)
+)
+print(missing_report[missing_report["qtd_nulos"] > 0])
+
+cobertura_datas = (
+    df_orders_total.groupby("store_id")["date"]
+    .agg(data_inicio="min", data_fim="max", dias_com_dados="nunique")
+    .assign(dias_operacao=lambda d: (d["data_fim"] - d["data_inicio"]).dt.days + 1)
+    .assign(cobertura_pct=lambda d: (d["dias_com_dados"] / d["dias_operacao"] * 100).round(1))
+    .sort_values("cobertura_pct")
+    .reset_index()
+)
+
+outlier_report = (
+    df_outliers_removidos.groupby("store_id")
+    .size()
+    .rename("qtd_outliers_removidos")
+    .reset_index()
+    .sort_values("qtd_outliers_removidos", ascending=False)
+)
+
+# %% [markdown]
+# ## Resumo de negócio — Lift por evento (marca e estado, por Tier)
+
+# %% Tabelas de lift por marca/evento e estado/evento
+df_ativo = df_orders_total.replace([np.inf, -np.inf], np.nan)
+df_ativo = df_ativo.fillna(df_ativo.median(numeric_only=True))
+
+lift_brand_evento = (
+    df_ativo.query("tipo_data != 'dia normal'")
+    .groupby(["brand_name", "evento"])
+    .agg(
+        pedidos_medio=("pedidos_total", "mean"),
+        baseline_media=("baseline_lift", "mean"),
+        lift_medio_pct=("lift_medio_evento_pct", "mean"),
+        observacoes=("pedidos_total", "count"),
+    )
+    .round(2)
+    .reset_index()
+    .sort_values(["brand_name", "lift_medio_pct"], ascending=[True, False])
+)
+
+lift_estado_evento = (
+    df_ativo.query("evento != 'dia normal'")
+    .groupby(["store_state", "evento"])
+    .agg(
+        pedidos_medio=("pedidos_total", "mean"),
+        baseline_media=("baseline_lift", "mean"),
+        lift_medio_pct=("lift_medio_evento_pct", "mean"),
+        qtd_lojas=("store_id", "nunique"),
+    )
+    .round(2)
+    .reset_index()
+    .sort_values(["store_state", "lift_medio_pct"], ascending=[True, False])
+)
+
+# %% Função reutilizável — heatmap Estado × Evento por Tier
+def plot_heatmap_estado_evento(df, tier_nome):
+    df_tier = df[df["Tier"] == tier_nome]
+    ordem_eventos = (
+        df_tier.query("evento != 'dia normal'")
+        .groupby("evento", as_index=False).agg(data_inicio=("date", "min"))
+        .sort_values("data_inicio")["evento"].tolist()
+    )
+
+    pivot = df_tier.pivot_table(index="store_state", columns="evento",
+                                 values="lift_medio_evento_pct", aggfunc="mean")
+    ordem_eventos = [e for e in ordem_eventos if e in pivot.columns]
+    pivot = pivot[ordem_eventos].loc[pivot.mean(axis=1).sort_values(ascending=False).index]
+
+    limite = np.nanmax(np.abs(pivot.values))
+    fig, ax = plt.subplots(figsize=(max(12, pivot.shape[1] * 1.5), max(8, pivot.shape[0] * 0.5)))
+    ax.set_facecolor("#E6E6E6")
+    sns.heatmap(pivot, mask=pivot.isna(), annot=True, fmt=".1f", cmap="RdBu", center=0,
+                vmin=-limite, vmax=limite, linewidths=0.6, linecolor="white",
+                cbar_kws={"label": "Lift Médio (%)", "shrink": 0.8}, annot_kws={"size": 9}, ax=ax)
+    ax.set_title(f"{tier_nome} — Lift Médio (%) por Estado e Evento", fontsize=15, weight="bold", pad=18)
+    ax.set_xlabel("Evento"); ax.set_ylabel("Estado")
+    plt.xticks(rotation=45, ha="right"); plt.yticks(rotation=0)
+    plt.tight_layout(); plt.show()
+
+for tier in df_ativo["Tier"].dropna().unique():
+    plot_heatmap_estado_evento(df_ativo, tier)
+
+# %% [markdown]
+# ## Impacto por dia da semana (share e lift), por Tier
+
+# %% Função reutilizável — impacto por dia da semana + heatmap
+ORDEM_DIAS = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
+CMAP_AZUL = sns.blend_palette(["#86A9E4", "#0000FF", "#000859"], as_cmap=True)
+
+def impacto_dia_semana(df):
+    tab = (
+        df.groupby(["brand_name", "dia_da_semana"])
+        .agg(pedidos_total=("pedidos_total", "sum"),
+             pedidos_medio=("pedidos_total", "mean"),
+             mediana=("pedidos_total", "median"),
+             qtd_registros=("pedidos_total", "count"))
+        .reset_index()
+    )
+    total_marca = tab.groupby("brand_name")["pedidos_total"].transform("sum")
+    tab["share_pct"] = (tab["pedidos_total"] / total_marca * 100).round(2)
+    return tab
+
+def plot_heatmap_dia_semana(tab, titulo):
+    pivot = tab.pivot(index="brand_name", columns="dia_da_semana", values="share_pct")[ORDEM_DIAS]
+    pivot = pivot.loc[pivot.mean(axis=1).sort_values(ascending=False).index]
+
+    fig, ax = plt.subplots(figsize=(max(10, pivot.shape[1] * 1.4), max(7, pivot.shape[0] * 0.55)))
+    sns.heatmap(pivot, annot=True, fmt=".1f", cmap=CMAP_AZUL, linewidths=0.6, linecolor="white",
+                vmin=np.floor(pivot.min().min()), vmax=np.ceil(pivot.max().max()),
+                cbar_kws={"label": "Share (%)", "shrink": 0.8},
+                annot_kws={"size": 9, "weight": "bold"}, ax=ax)
+    ax.set_title(titulo, fontsize=15, weight="bold", pad=18)
+    ax.set_xlabel("Dia da Semana"); ax.set_ylabel("Bandeira")
+    ax.tick_params(axis="x", rotation=0)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    plt.tight_layout(); plt.show()
+
+for tier in df_ativo["Tier"].dropna().unique():
+    tab = impacto_dia_semana(df_ativo[df_ativo["Tier"] == tier])
+    plot_heatmap_dia_semana(tab, f"{tier} — Share (%) dos Pedidos por Bandeira e Dia da Semana")
+
+# %% Lift médio por dia da semana (útil para forecast)
+lift_dia_semana = (
+    df_ativo.groupby(["Tier", "brand_name", "dia_da_semana"])
+    .agg(lift_medio_pct=("lift_incremental_pct", "mean"))
+    .round(2)
+    .reset_index()
+)
+
+# %% [markdown]
+# ## Clusterização de lojas
+# Features: volume (mm28), maturidade, intermitência, taxa de reserva e comparecimento.
+# Roda tanto no conjunto geral quanto por Tier, usando a mesma função.
+
+# %% Função reutilizável de clusterização
+FEATURES_CLUSTER = ["mm28", "idade_loja_dias", "pct_sem_operacao_28", "taxa_reserva", "taxa_comparecimento"]
+
+def clusterizar_lojas(df, titulo, k_ideal=3):
+    df_lojas = (
+        df.groupby(["store_id", "store_name", "brand_name"])[FEATURES_CLUSTER]
+        .mean()
+        .reset_index()
+        .replace([np.inf, -np.inf], np.nan)
+    )
+    df_lojas["pct_sem_operacao_28"] = df_lojas["pct_sem_operacao_28"].fillna(0)
+    for c in FEATURES_CLUSTER:
+        df_lojas[c] = df_lojas[c].fillna(df_lojas[c].median())
+
+    X = RobustScaler().fit_transform(df_lojas[FEATURES_CLUSTER])
+
+    K_range = range(2, 6)
+    silhouettes = []
+    for k in K_range:
+        labels = KMeans(n_clusters=k, random_state=42, n_init=10).fit_predict(X)
+        silhouettes.append(silhouette_score(X, labels))
+    melhor_k = list(K_range)[int(np.argmax(silhouettes))]
+    print(f"[{titulo}] Melhor K por silhouette: {melhor_k} (score={max(silhouettes):.3f}) — usando k_ideal={k_ideal}")
+
+    km_final = KMeans(n_clusters=k_ideal, random_state=42, n_init=10)
+    df_lojas["cluster"] = km_final.fit_predict(X)
+
+    perfil = df_lojas.groupby("cluster")[FEATURES_CLUSTER].mean().round(3)
+    perfil_norm = (perfil - perfil.min()) / (perfil.max() - perfil.min())
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    sns.heatmap(perfil_norm.T, annot=perfil.T, fmt=".2f", cmap="RdYlGn", linewidths=0.5,
+                cbar_kws={"label": "valor normalizado (0-1 por variável)"}, ax=ax)
+    ax.set_title(f"{titulo} — Perfil Médio por Cluster")
+    ax.set_xlabel("Cluster"); ax.set_ylabel("Variável")
+    plt.tight_layout(); plt.show()
+
+    pca = PCA(n_components=3, random_state=42)
+    coords = pca.fit_transform(X)
+    var = pca.explained_variance_ratio_ * 100
+    df_lojas[["pca_1", "pca_2", "pca_3"]] = coords
+
+    cores = ["#1b9e77", "#d95f02", "#7570b3", "#e7298a", "#66a61e"]
+    traces = []
+    for c in sorted(df_lojas["cluster"].unique()):
+        sub = df_lojas[df_lojas["cluster"] == c]
+        hover = (
+            sub["store_name"].astype(str) + " (" + sub["brand_name"].astype(str) + ")"
+            + "<br>volume(mm28): " + sub["mm28"].round(1).astype(str)
+            + "<br>maturidade: " + sub["idade_loja_dias"].round(0).astype(str) + " dias"
+            + "<br>intermitência: " + sub["pct_sem_operacao_28"].round(2).astype(str)
+        )
+        traces.append(go.Scatter3d(
+            x=sub["pca_1"], y=sub["pca_2"], z=sub["pca_3"], mode="markers",
+            name=f"Cluster {c} (n={len(sub)})",
+            marker=dict(size=4, color=cores[c % len(cores)], opacity=0.8,
+                        line=dict(width=0.5, color="white")),
+            text=hover, hoverinfo="text",
+        ))
+
+    fig3d = go.Figure(data=traces)
+    fig3d.update_layout(
+        title=dict(text=f"{titulo} — Clusters de Lojas (PCA 3D, {var[:3].sum():.0f}% var. explicada)", x=0.5),
+        scene=dict(xaxis_title=f"PC1 ({var[0]:.0f}%)", yaxis_title=f"PC2 ({var[1]:.0f}%)",
+                   zaxis_title=f"PC3 ({var[2]:.0f}%)"),
+        width=950, height=720, legend=dict(itemsizing="constant"),
+    )
+    fig3d.write_html(f"cluster_pca_3d_{titulo.lower().replace(' ', '_')}.html",
+                      include_plotlyjs="cdn", auto_play=False)
+    fig3d.show()
+
+    return df_lojas
+
+# %% Rodando clusterização — geral e por Tier
+clusters_geral = clusterizar_lojas(df_orders_total, "Geral")
+
+for tier in df_orders_total["Tier"].dropna().unique():
+    clusterizar_lojas(df_orders_total[df_orders_total["Tier"] == tier], tier)
+
+# %% [markdown]
+# ## Próximas etapas do pipeline (placeholders)
+# - Seleção de features para modelagem
+# - Backtesting
+# - Forecast
+# - Deploy / Dashboard
+
+# %% Export
+# df_orders_total.to_excel(BASE_DIR / "df_orders_total.xlsx", index=False)
+# df_orders_total.to_csv(BASE_DIR / "df_orders_total.csv", index=False, sep=";", encoding="utf-8-sig")
