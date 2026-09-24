@@ -1,0 +1,796 @@
+# %% [markdown]
+# # Retail Demand Pipeline — ETL, Feature Engineering, Lift Analysis & Clustering
+# Portfolio-safe version with fictional entities. Adjust `BASE_DIR` and `BRAND_ALIAS_MAP`
+# for your environment before running.
+
+# %% Imports
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.graph_objects as go
+from pathlib import Path
+from datetime import datetime, timedelta
+from dateutil.easter import easter
+from sklearn.preprocessing import RobustScaler
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.decomposition import PCA
+
+sns.set_theme(style="whitegrid", palette="muted")
+
+# %% Configuration — paths and anonymization
+# Replace with your local path (or use the DATA_DIR environment variable)
+BASE_DIR = Path(r"C:/portfolio/retail_demand")
+
+ORDERS_FILE   = BASE_DIR / "daily_orders.csv"
+SITE_REGISTRY_FILE = BASE_DIR / "site_registry.xlsx"
+CALENDAR_FILE     = BASE_DIR / "commercial_calendar.xlsx"
+EXCLUDED_SITES_FILE = BASE_DIR / "excluded_sites.txt"  # one site_id per line
+
+# Fictional source labels -> portfolio-safe aliases.
+# Replace these aliases as needed for your own environment.
+BRAND_ALIAS_MAP = {
+    "Northstar Wholesale": "Aurora Market",
+    "Northstar Cash & Carry": "Aurora Market",
+    "BlueRiver Grocers": "Solstice Foods",
+    "Harbor Value Stores": "Cedar Retail",
+}
+
+REGISTRY_COLUMNS = ["Site ID", "Region", "Fulfillment_Mode", "Segment", "Site_Status"]
+
+# %% Load raw data
+raw_orders = pd.read_csv(ORDERS_FILE, sep=",", encoding="utf-8")
+
+df_active_sites = pd.read_excel(SITE_REGISTRY_FILE)[REGISTRY_COLUMNS].copy()
+df_active_sites["Site ID"] = df_active_sites["Site ID"].astype(str).str.strip()
+df_active_sites.drop_duplicates(subset=["Site ID"], inplace=True)
+for col in ["Fulfillment_Mode", "Segment", "Site_Status"]:
+    df_active_sites[col] = df_active_sites[col].astype(str).str.strip()
+
+# Optional list of sites to exclude (kept external, not hardcoded)
+if EXCLUDED_SITES_FILE.exists():
+    excluded_sites = (
+        EXCLUDED_SITES_FILE.read_text(encoding="utf-8").splitlines()
+    )
+    excluded_sites = [x.strip() for x in excluded_sites if x.strip()]
+else:
+    excluded_sites = []
+
+# %% Select columns and merge site registry
+ORDER_COLUMNS = [
+    "order_date", "retail_brand", "brand_key", "site_id", "site_name",
+    "city", "state_code", "order_count",
+    "booked_slots", "attended_slots",
+]
+raw_orders = raw_orders[ORDER_COLUMNS].copy()
+raw_orders["site_id"] = raw_orders["site_id"].astype(str).str.strip()
+raw_orders["site_name"] = raw_orders["site_name"].astype(str).str.strip()
+raw_orders["order_date"] = pd.to_datetime(raw_orders["order_date"])
+
+df_daily_orders = raw_orders.merge(
+    df_active_sites, left_on="site_id", right_on="Site ID", how="inner"
+)
+
+df_daily_orders = (
+    df_daily_orders.groupby(
+        ["order_date", "retail_brand", "brand_key", "site_id", "site_name",
+         "city", "state_code", "Fulfillment_Mode", "Segment", "Site_Status"]
+    )
+    .agg(
+        order_count=("order_count", "sum"),
+        booked_slots=("booked_slots", "sum"),
+        attended_slots=("attended_slots", "sum"),
+    )
+    .reset_index()
+)
+
+# %% Apply brand aliases, exclude inactive sites and home-delivery rows
+df_daily_orders["retail_brand"] = df_daily_orders["retail_brand"].replace(BRAND_ALIAS_MAP)
+
+df_daily_orders = df_daily_orders[~df_daily_orders["site_id"].isin(excluded_sites)]
+df_daily_orders = df_daily_orders[df_daily_orders["Fulfillment_Mode"] != "Home Delivery"].copy()
+
+# %% Calendar — business day / weekend
+df_daily_orders["day_type"] = np.where(
+    df_daily_orders["order_date"].dt.dayofweek < 5, "Business Day", "Weekend"
+)
+
+# %% Generate holidays and commercial dates (script-based)
+years = range(2024, datetime.today().year + 1)
+special_dates = []
+
+for year in years:
+    special_dates.extend([
+        (datetime(year, 1, 1), "New Year's Day"),
+        (datetime(year, 4, 21), "National Heritage Day"),
+        (datetime(year, 5, 1), "Labor Day"),
+        *[(datetime(year, 6, d), "Mid-Year Festival") for d in range(21, 26)],
+        (datetime(year, 9, 7), "National Day"),
+        (datetime(year, 10, 12), "Regional Holiday"),
+        (datetime(year, 11, 2), "Memorial Day"),
+        (datetime(year, 11, 15), "Civic Holiday"),
+        *[(datetime(year, 12, d), "Year-End Holiday Period") for d in range(24, 32)],
+    ])
+    special_dates += [(datetime(year, 7, d), "Mid-Year Break") for d in range(1, 10)]
+
+    easter_date = easter(year)
+    special_dates.append((easter_date, "Easter"))
+    carnival = easter_date - timedelta(days=47)
+    special_dates += [(carnival, "Carnival"), (carnival + timedelta(days=1), "Carnival")]
+
+    may = pd.date_range(f"{year}-05-01", f"{year}-05-31", freq="D")
+    special_dates.append((may[may.dayofweek == 6][1], "Mother's Day"))
+
+    august = pd.date_range(f"{year}-08-01", f"{year}-08-31", freq="D")
+    special_dates.append((august[august.dayofweek == 6][1], "Father's Day"))
+
+    special_dates.append((datetime(year, 10, 12), "Children's Day"))
+
+    november = pd.date_range(f"{year}-11-01", f"{year}-11-30", freq="D")
+    black_friday = november[november.dayofweek == 4][-1]
+    black_friday_week = pd.date_range(black_friday - timedelta(days=6), black_friday, freq="D")
+    special_dates += [(d, "Black Friday Period") for d in black_friday_week]
+
+    cyber_monday = black_friday + timedelta(days=3)
+    special_dates += [(cyber_monday + timedelta(days=i), "Black Friday Period") for i in range(4)]
+
+df_special_dates = pd.DataFrame(special_dates, columns=["order_date", "event_name"])
+df_special_dates["order_date"] = pd.to_datetime(df_special_dates["order_date"])
+today = pd.Timestamp.today().normalize()
+df_special_dates = df_special_dates[df_special_dates["order_date"] <= today].drop_duplicates().sort_values("order_date")
+
+df_special_dates_dedup = (
+    df_special_dates.groupby("order_date")["event_name"]
+    .apply(lambda x: " | ".join(x.unique()))
+    .reset_index()
+)
+
+df_order_features = df_daily_orders.merge(df_special_dates_dedup, on="order_date", how="left")
+
+# %% Time-based features
+WEEKDAY_LABELS = {0: "Monday", 1: "Tuesday", 2: "Wednesday", 3: "Thursday",
+                4: "Friday", 5: "Saturday", 6: "Sunday"}
+
+df_order_features["year"] = df_order_features["order_date"].dt.year
+df_order_features["month"] = df_order_features["order_date"].dt.month
+df_order_features["weekday"] = (
+    df_order_features["order_date"].dt.dayofweek.map(WEEKDAY_LABELS).astype("category")
+)
+df_order_features["iso_week"] = df_order_features["order_date"].dt.isocalendar().week
+df_order_features["quarter"] = df_order_features["order_date"].dt.quarter
+
+# %% Event/campaign window (-4 to +2 days around each special date)
+df_order_features["calendar_type"] = "regular day"
+event_dates = df_order_features.loc[df_order_features["event_name"].notna(), "order_date"]
+df_order_features.loc[df_order_features["event_name"].notna(), "calendar_type"] = "campaign"
+
+for event_date in event_dates:
+    window_start, window_end = event_date - pd.Timedelta(days=4), event_date + pd.Timedelta(days=2)
+    mask = (
+        (df_order_features["order_date"] >= window_start)
+        & (df_order_features["order_date"] <= window_end)
+        & (df_order_features["order_date"] != event_date)
+    )
+    df_order_features.loc[mask, "calendar_type"] = "campaign"
+
+# %% Days to / since nearest event
+event_dates_sorted = np.sort(df_order_features.loc[df_order_features["event_name"].notna(), "order_date"].unique())
+
+def days_to_next_event(date_value):
+    future_dates = event_dates_sorted[event_dates_sorted >= date_value]
+    return (date_value - event_dates_sorted[-1]).days if len(future_dates) == 0 else (future_dates[0] - date_value).days
+
+def days_since_last_event(date_value):
+    past_dates = event_dates_sorted[event_dates_sorted <= date_value]
+    if len(past_dates) == 0:
+        return (date_value - df_order_features["order_date"].min()).days + 1
+    return (date_value - past_dates[-1]).days
+
+df_order_features["days_to_event"] = df_order_features["order_date"].apply(days_to_next_event)
+df_order_features["days_since_event"] = df_order_features["order_date"].apply(days_since_last_event)
+df_order_features["event_name"] = df_order_features["event_name"].fillna("regular day")
+
+# %% IQR classification (business day vs weekend)
+def classify_iqr(
+    df, value_col="order_count", day_type_col="day_type",
+    group_cols=("site_id", "year"), business_day_label="Business Day", weekend_label="Weekend",
+    iqr_factor=1.5,
+):
+    group_cols = list(group_cols)
+    df = df.copy()
+
+    def _quartiles(day_label, suffix):
+        q = (
+            df[df[day_type_col] == day_label]
+            .groupby(group_cols)[value_col]
+            .quantile([0.25, 0.50, 0.75])
+            .unstack()
+            .reset_index()
+        )
+        q.columns = group_cols + [f"Q1{suffix}", f"Q2{suffix}", f"Q3{suffix}"]
+        return q
+
+    quartiles = _quartiles(business_day_label, "DU").merge(_quartiles(weekend_label, "FDS"), on=group_cols, how="outer")
+    df = df.merge(quartiles, on=group_cols, how="left")
+
+    for suffix in ("DU", "FDS"):
+        q1, q3 = f"Q1{suffix}", f"Q3{suffix}"
+        df[f"IQR{suffix}"] = df[q3] - df[q1]
+        df[f"LI_{suffix}"] = df[q1] - iqr_factor * df[f"IQR{suffix}"]
+        df[f"LS_{suffix}"] = df[q3] + iqr_factor * df[f"IQR{suffix}"]
+
+    row_suffix = np.where(df[day_type_col] == business_day_label, "DU", "FDS")
+    li = np.where(row_suffix == "DU", df["LI_DU"], df["LI_FDS"])
+    ls = np.where(row_suffix == "DU", df["LS_DU"], df["LS_FDS"])
+    is_outside = (df[value_col] < li) | (df[value_col] > ls)
+    df["iqr_class"] = np.where(is_outside, "Outlier", "Inlier")
+
+    return df
+
+df_order_features = classify_iqr(df_order_features)
+
+# %% Lag, rolling-average and volatility features
+def add_lags(df, value_col="order_count", group_cols="site_id",
+                   date_col="order_date", lags=(1, 7, 14, 21, 28)):
+    df = df.sort_values([group_cols, date_col]).copy()
+    for lag in lags:
+        df[f"lag_{lag}"] = df.groupby(group_cols)[value_col].shift(lag)
+    return df
+
+def add_rolling_means(df, value_col="order_count", group_cols="site_id",
+                            date_col="order_date", windows=(7, 14, 21, 28), shift=1, decimals=2):
+    df = df.sort_values([group_cols, date_col]).copy()
+    for j in windows:
+        df[f"mm{j}"] = (
+            df.groupby(group_cols)[value_col]
+            .transform(lambda x, j=j: x.shift(shift).rolling(j).mean().round(decimals))
+        )
+    return df
+
+def add_rolling_volatility(df, value_col="order_count", group_cols="site_id",
+                           date_col="order_date", windows=(7, 14, 21, 28), shift=1, decimals=2):
+    df = df.sort_values([group_cols, date_col]).copy()
+    for j in windows:
+        df[f"std{j}"] = (
+            df.groupby(group_cols)[value_col]
+            .transform(lambda x, j=j: x.shift(shift).rolling(j).std().round(decimals))
+        )
+    return df
+
+df_order_features = add_lags(df_order_features)
+df_order_features = add_rolling_means(df_order_features)
+df_order_features = add_rolling_volatility(df_order_features)
+
+# %% Outlier flag
+df_order_features["is_outlier"] = (df_order_features["iqr_class"] != "Inlier").astype(int)
+df_order_features.loc[
+    (df_order_features["calendar_type"] == "campaign") & (df_order_features["iqr_class"] == "Outlier"),
+    "is_outlier",
+] = 1
+
+# %% Booking and attendance rates
+df_order_features["attendance_rate"] = np.where(
+    df_order_features["booked_slots"] > 0,
+    df_order_features["attended_slots"] / df_order_features["booked_slots"],
+    np.nan,
+)
+df_order_features["booking_conversion_rate"] = np.where(
+    df_order_features["booked_slots"] > 0,
+    df_order_features["order_count"] / df_order_features["booked_slots"],
+    np.nan,
+)
+
+# %% Normalize state labels
+STATE_ALIAS_MAP = {
+    "State Beta": "SB", "State Gamma": "SG", "State Delta": "SD", "State Epsilon": "SE",
+    "State Zeta": "SZ", "State Eta": "ST", "State Theta": "SH",
+    "State Alpha": "SA", "State A": "SA",
+}
+df_order_features["state_code"] = df_order_features["state_code"].str.replace("RG-", "", regex=False)
+for source_label, state_code in STATE_ALIAS_MAP.items():
+    df_order_features["state_code"] = df_order_features["state_code"].str.replace(source_label, state_code, regex=False)
+
+df_order_features["city"] = df_order_features["city"].str.title()
+df_order_features["retail_brand"] = df_order_features["retail_brand"].str.strip().str.title()
+
+# %% Fill missing lag / rolling / volatility / rate features using rolling medians
+rolling_mean_cols = ["mm7", "mm14", "mm21", "mm28"]
+lag_cols = ["lag_1", "lag_7", "lag_14", "lag_21", "lag_28"]
+volatility_cols = ["std7", "std14", "std21", "std28"]
+rate_cols = ["attendance_rate", "booking_conversion_rate"]
+feature_cols = lag_cols + rolling_mean_cols + volatility_cols + rate_cols
+
+def fill_missing_rolling_median(x):
+    filled = x.copy()
+    for w in [3, 5, 7, 10, 14, 21, 28, 35, 45, 60, 75, 90]:
+        filled = filled.fillna(filled.rolling(window=w, min_periods=1).median())
+    return filled
+
+for col in feature_cols:
+    df_order_features[col] = df_order_features.groupby("site_id")[col].transform(fill_missing_rolling_median)
+
+for col in feature_cols:
+    mask = df_order_features[col].isnull()
+    if mask.any():
+        df_order_features.loc[mask, col] = (
+            df_order_features.groupby("retail_brand")[col].transform(fill_missing_rolling_median).loc[mask]
+        )
+
+for col in feature_cols:
+    mask = df_order_features[col].isnull()
+    if mask.any():
+        df_order_features.loc[mask, col] = df_order_features[col].median()
+
+for col in rolling_mean_cols + lag_cols:
+    invalid_mask = df_order_features[col].isnull() | (df_order_features[col] == 0)
+    df_order_features.loc[invalid_mask, col] = df_order_features.loc[invalid_mask, "order_count"]
+
+for col in volatility_cols + rate_cols:
+    df_order_features[col] = df_order_features[col].fillna(0)
+
+# %% Short-vs-long term momentum
+def momentum_status(short_avg, long_avg, momentum):
+    if long_avg == 0 and short_avg > 0:
+        return "Emerging Growth"
+    if long_avg == 0 and short_avg == 0:
+        return "No Movement"
+    if momentum > 1.05:
+        return "Growth"
+    if momentum < 0.95:
+        return "Decline"
+    return "Stable"
+
+df_order_features["momentum_7_21"] = (
+    df_order_features["mm7"] / df_order_features["mm21"].replace(0, np.nan)
+).round(2)
+df_order_features["momentum_status_7_21"] = df_order_features.apply(
+    lambda r: momentum_status(r["mm7"], r["mm21"], r["momentum_7_21"]), axis=1
+)
+
+df_order_features["momentum_7_28"] = (
+    df_order_features["mm7"] / df_order_features["mm28"].replace(0, np.nan)
+).round(2)
+df_order_features["momentum_status_7_28"] = df_order_features.apply(
+    lambda r: momentum_status(r["mm7"], r["mm28"], r["momentum_7_28"]), axis=1
+)
+
+df_order_features["cv_7d"] = (
+    df_order_features["std7"] / df_order_features["mm7"].replace(0, np.nan)
+).round(4)
+
+# %% Site lifecycle (new / active / closed)
+LATEST_DATE = df_order_features["order_date"].max()
+LIFECYCLE_THRESHOLD_DAYS = 10
+
+site_lifecycle = (
+    df_order_features.groupby("site_id")
+    .agg(first_date=("order_date", "min"), last_date=("order_date", "max"), days_with_data=("order_date", "nunique"))
+    .reset_index()
+    .assign(
+        operating_span_days=lambda d: (d["last_date"] - d["first_date"]).dt.days + 1,
+        coverage_ratio=lambda d: d["days_with_data"] / d["operating_span_days"],
+        lifecycle_status=lambda d: np.select(
+            [d["first_date"] > LATEST_DATE - pd.Timedelta(days=LIFECYCLE_THRESHOLD_DAYS),
+             d["last_date"] < LATEST_DATE - pd.Timedelta(days=LIFECYCLE_THRESHOLD_DAYS)],
+            ["new", "closed"],
+            default="active",
+        ),
+    )
+)
+
+df_order_features = df_order_features.merge(
+    site_lifecycle[["site_id", "lifecycle_status"]], on="site_id", how="left"
+)
+
+# %% Site-size proxy based on median order volume
+site_size = (
+    df_order_features.groupby("site_id")["order_count"]
+    .median()
+    .rename("median_volume")
+    .reset_index()
+)
+site_size["site_size"] = pd.qcut(site_size["median_volume"], q=3, labels=["small", "medium", "large"])
+
+df_order_features = df_order_features.merge(site_size[["site_id", "site_size"]], on="site_id", how="left")
+df_order_features["site_size"] = df_order_features["site_size"].astype(str)
+df_order_features["weekday"] = df_order_features["weekday"].astype(str)
+
+# Remove outliers from the main modeling dataset (kept separately for diagnostics)
+df_removed_outliers = df_order_features[df_order_features["is_outlier"] == 1].copy()
+df_order_features = df_order_features[df_order_features["is_outlier"] == 0].reset_index(drop=True)
+
+# %% Reorder columns
+df_order_features = df_order_features[[
+    "order_date", "brand_key", "retail_brand", "site_id", "site_name", "city",
+    "state_code", "Fulfillment_Mode", "Segment", "Site_Status", "order_count", "booked_slots",
+    "attended_slots", "weekday", "iso_week", "month", "quarter", "year",
+    "day_type", "calendar_type", "event_name", "days_to_event", "days_since_event",
+    "Q1DU", "Q2DU", "Q3DU", "Q1FDS", "Q2FDS", "Q3FDS", "IQRDU", "LI_DU", "LS_DU",
+    "IQRFDS", "LI_FDS", "LS_FDS", "iqr_class", "lag_1", "lag_7", "lag_14",
+    "lag_21", "lag_28", "mm7", "mm14", "mm21", "mm28", "std7", "std14", "std21", "std28",
+    "is_outlier", "attendance_rate", "booking_conversion_rate", "momentum_7_21",
+    "momentum_status_7_21", "momentum_7_28", "momentum_status_7_28", "site_size", "cv_7d",
+    "lifecycle_status",
+]]
+
+# %% Lift — impact of events/campaigns on order volume
+NORMAL_BASELINE_WINDOW = 28
+EVENT_FALLBACK_WINDOWS = [14, 21, 28, 42, 56, 90, 180, 365]
+INACTIVITY_WINDOWS = [7, 14, 21, 28]
+MIN_BASELINE_DAYS = 3
+REGULAR_DAY_LABEL = "regular day"
+
+def _classify_zero_days(df_site):
+    has_orders = df_site["order_count"] > 0
+    has_booked_slots = df_site["booked_slots"] > 0
+    zero_type = pd.Series("normal operation", index=df_site.index)
+    zero_type[~has_orders & has_booked_slots] = "operational zero"
+    zero_type[~has_orders & ~has_booked_slots] = "true zero"
+    return zero_type
+
+def _identify_event_blocks(df_site, event_mask):
+    if not event_mask.any():
+        return pd.DataFrame(columns=["start_idx", "end_idx", "event_name"])
+
+    event_name, order_date = df_site["event_name"], df_site["order_date"]
+    new_block = event_mask & (
+        ~event_mask.shift(1, fill_value=False)
+        | (event_name != event_name.shift(1))
+        | (order_date.diff().dt.days != 1)
+    )
+    block_id = new_block.cumsum().where(event_mask)
+
+    return (
+        df_site.loc[event_mask]
+        .assign(_block_id=block_id[event_mask])
+        .groupby("_block_id")
+        .apply(lambda g: pd.Series({
+            "start_idx": g.index.min(), "end_idx": g.index.max(), "event_name": g["event_name"].iloc[0],
+        }), include_groups=False)
+        .reset_index(drop=True)
+    )
+
+def _calculate_regular_baseline(df_site, baseline_mask):
+    regular_orders = df_site["baseline_input_orders"].where(baseline_mask)
+    return regular_orders.shift(1).rolling(window=NORMAL_BASELINE_WINDOW, min_periods=1).mean()
+
+def _baseline_for_event_block(df_site, baseline_mask, start_idx):
+    event_start_date = df_site.loc[start_idx, "order_date"]
+    before_event = baseline_mask & (df_site["order_date"] < event_start_date)
+
+    for days in EVENT_FALLBACK_WINDOWS:
+        in_window = before_event & (df_site["order_date"] >= event_start_date - pd.Timedelta(days=days))
+        valid = in_window & df_site["baseline_input_orders"].notna()
+        if valid.sum() >= MIN_BASELINE_DAYS:
+            return df_site.loc[valid, "baseline_input_orders"].mean()
+
+    all_valid = before_event & df_site["baseline_input_orders"].notna()
+    if all_valid.sum() >= 1:
+        return df_site.loc[all_valid, "baseline_input_orders"].mean()
+
+    if start_idx > df_site.index.min():
+        return df_site.loc[start_idx - 1, "baseline_orders"]
+    return np.nan
+
+def _add_inactivity_features(df_site):
+    df_site["operated_today"] = (df_site["order_count"] > 0).astype(int)
+    is_true_zero = (df_site["zero_type"] == "true zero").astype(float)
+    for window in INACTIVITY_WINDOWS:
+        df_site[f"inactivity_rate_{window}"] = (
+            is_true_zero.shift(1).rolling(window=window, min_periods=1).mean().round(4)
+        )
+    return df_site
+
+def process_site(df_site):
+    df_site = df_site.sort_values("order_date").reset_index(drop=True)
+    baseline_mask = df_site["calendar_type"] == "regular day"
+    event_mask = df_site["event_name"] != REGULAR_DAY_LABEL
+
+    df_site["zero_type"] = _classify_zero_days(df_site)
+    df_site["baseline_input_orders"] = df_site["order_count"].astype(float)
+    df_site.loc[df_site["zero_type"] == "operational zero", "baseline_input_orders"] = np.nan
+
+    df_site["baseline_orders"] = _calculate_regular_baseline(df_site, baseline_mask)
+
+    for _, block in _identify_event_blocks(df_site, event_mask).iterrows():
+        start_idx, end_idx = int(block["start_idx"]), int(block["end_idx"])
+        indices = df_site.index[(df_site.index >= start_idx) & (df_site.index <= end_idx)]
+
+        baseline = _baseline_for_event_block(df_site, baseline_mask, start_idx)
+        df_site.loc[indices, "baseline_orders"] = baseline
+
+        event_mean = df_site.loc[indices, "order_count"].mean()
+        avg_lift = (
+            round((event_mean - baseline) / baseline * 100, 2)
+            if pd.notna(baseline) and baseline != 0 else np.nan
+        )
+        df_site.loc[indices, "event_avg_orders"] = round(event_mean, 2)
+        df_site.loc[indices, "avg_event_lift_pct"] = avg_lift
+
+    df_site["baseline_orders"] = df_site["baseline_orders"].round(2)
+    baseline_ok = df_site["baseline_orders"].notna() & (df_site["baseline_orders"] != 0)
+    df_site["invalid_baseline"] = (~baseline_ok).astype(int)
+    df_site["incremental_lift_pct"] = np.where(
+        baseline_ok,
+        (df_site["order_count"] - df_site["baseline_orders"]) / df_site["baseline_orders"] * 100,
+        np.nan,
+    ).round(2)
+
+    return _add_inactivity_features(df_site).drop(columns=["baseline_input_orders"])
+
+def calculate_lift(df):
+    df = df.sort_values(["site_id", "order_date"]).reset_index(drop=True)
+    return pd.concat(
+        [process_site(g).assign(site_id=sid) for sid, g in df.groupby("site_id")],
+        ignore_index=True,
+    )
+
+df_order_features = calculate_lift(df_order_features)
+
+for col in ["mm21", "booking_conversion_rate", "momentum_7_21", "momentum_7_28", "cv_7d"]:
+    df_order_features[col] = df_order_features[col].round(4)
+
+df_order_features["retail_brand"] = df_order_features["retail_brand"].str.capitalize()
+
+print(f"df_order_features: {df_order_features.shape[0]:,} rows × {df_order_features.shape[1]} columns")
+
+# %% Weekly growth and site age
+df_order_features["growth_7_28_pct"] = (
+    (df_order_features["lag_7"] - df_order_features["lag_28"]) / df_order_features["lag_28"] * 100
+).round(2)
+
+site_open_date = df_order_features.groupby("site_id")["order_date"].min()
+df_order_features["site_age_days"] = (
+    df_order_features["order_date"] - df_order_features["site_id"].map(site_open_date)
+).dt.days
+
+# %% Monthly seasonality by site
+site_seasonality = (
+    df_order_features.groupby(["site_id", "site_name", "month"])
+    .agg(seasonal_avg_orders=("order_count", "mean"))
+    .round(2)
+    .reset_index()
+)
+df_order_features = df_order_features.merge(
+    site_seasonality, on=["site_id", "site_name", "month"], how="left"
+)
+
+# %% [markdown]
+# ## Data quality checks
+
+# %% Duplicates, missing values, date coverage and outlier diagnostics
+print(f"Duplicate rows: {df_order_features.duplicated().sum():,}")
+
+missingness_report = (
+    pd.DataFrame({
+        "column": df_order_features.columns,
+        "null_count": df_order_features.isna().sum().values,
+        "null_pct": (df_order_features.isna().mean() * 100).round(2).values,
+    })
+    .sort_values("null_pct", ascending=False)
+)
+print(missingness_report[missingness_report["null_count"] > 0])
+
+date_coverage = (
+    df_order_features.groupby("site_id")["order_date"]
+    .agg(first_date="min", last_date="max", days_with_data="nunique")
+    .assign(operating_span_days=lambda d: (d["last_date"] - d["first_date"]).dt.days + 1)
+    .assign(coverage_pct=lambda d: (d["days_with_data"] / d["operating_span_days"] * 100).round(1))
+    .sort_values("coverage_pct")
+    .reset_index()
+)
+
+outlier_diagnostics = (
+    df_removed_outliers.groupby("site_id")
+    .size()
+    .rename("removed_outliers")
+    .reset_index()
+    .sort_values("removed_outliers", ascending=False)
+)
+
+# %% [markdown]
+# ## Business summary — event lift by brand and state (by segment)
+
+# %% Lift tables by brand/event and state/event
+df_analysis = df_order_features.replace([np.inf, -np.inf], np.nan)
+df_analysis = df_analysis.fillna(df_analysis.median(numeric_only=True))
+
+brand_event_lift = (
+    df_analysis.query("calendar_type != 'regular day'")
+    .groupby(["retail_brand", "event_name"])
+    .agg(
+        avg_orders=("order_count", "mean"),
+        avg_baseline=("baseline_orders", "mean"),
+        avg_lift_pct=("avg_event_lift_pct", "mean"),
+        observations=("order_count", "count"),
+    )
+    .round(2)
+    .reset_index()
+    .sort_values(["retail_brand", "avg_lift_pct"], ascending=[True, False])
+)
+
+state_event_lift = (
+    df_analysis.query("event_name != 'regular day'")
+    .groupby(["state_code", "event_name"])
+    .agg(
+        avg_orders=("order_count", "mean"),
+        avg_baseline=("baseline_orders", "mean"),
+        avg_lift_pct=("avg_event_lift_pct", "mean"),
+        site_count=("site_id", "nunique"),
+    )
+    .round(2)
+    .reset_index()
+    .sort_values(["state_code", "avg_lift_pct"], ascending=[True, False])
+)
+
+# %% Reusable heatmap — state × event by segment
+def plot_state_event_heatmap(df, segment_name):
+    df_segment = df[df["Segment"] == segment_name]
+    event_order = (
+        df_segment.query("event_name != 'regular day'")
+        .groupby("event_name", as_index=False).agg(first_event_date=("order_date", "min"))
+        .sort_values("first_event_date")["event_name"].tolist()
+    )
+
+    pivot = df_segment.pivot_table(index="state_code", columns="event_name",
+                                 values="avg_event_lift_pct", aggfunc="mean")
+    event_order = [e for e in event_order if e in pivot.columns]
+    pivot = pivot[event_order].loc[pivot.mean(axis=1).sort_values(ascending=False).index]
+
+    limit = np.nanmax(np.abs(pivot.values))
+    fig, ax = plt.subplots(figsize=(max(12, pivot.shape[1] * 1.5), max(8, pivot.shape[0] * 0.5)))
+    ax.set_facecolor("#E6E6E6")
+    sns.heatmap(pivot, mask=pivot.isna(), annot=True, fmt=".1f", cmap="RdBu", center=0,
+                vmin=-limit, vmax=limit, linewidths=0.6, linecolor="white",
+                cbar_kws={"label": "Average Lift (%)", "shrink": 0.8}, annot_kws={"size": 9}, ax=ax)
+    ax.set_title(f"{segment_name} — Average Lift (%) by State and Event", fontsize=15, weight="bold", pad=18)
+    ax.set_xlabel("Event"); ax.set_ylabel("State")
+    plt.xticks(rotation=45, ha="right"); plt.yticks(rotation=0)
+    plt.tight_layout(); plt.show()
+
+for segment in df_analysis["Segment"].dropna().unique():
+    plot_state_event_heatmap(df_analysis, segment)
+
+# %% [markdown]
+# ## Weekday impact (share and lift), by segment
+
+# %% Reusable weekday-impact function + heatmap
+WEEKDAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+BLUE_CMAP = sns.blend_palette(["#86A9E4", "#0000FF", "#000859"], as_cmap=True)
+
+def weekday_impact(df):
+    summary = (
+        df.groupby(["retail_brand", "weekday"])
+        .agg(total_orders=("order_count", "sum"),
+             avg_orders=("order_count", "mean"),
+             median_orders=("order_count", "median"),
+             record_count=("order_count", "count"))
+        .reset_index()
+    )
+    brand_total = summary.groupby("retail_brand")["total_orders"].transform("sum")
+    summary["share_pct"] = (summary["total_orders"] / brand_total * 100).round(2)
+    return summary
+
+def plot_weekday_heatmap(summary, title):
+    pivot = summary.pivot(index="retail_brand", columns="weekday", values="share_pct")[WEEKDAY_ORDER]
+    pivot = pivot.loc[pivot.mean(axis=1).sort_values(ascending=False).index]
+
+    fig, ax = plt.subplots(figsize=(max(10, pivot.shape[1] * 1.4), max(7, pivot.shape[0] * 0.55)))
+    sns.heatmap(pivot, annot=True, fmt=".1f", cmap=BLUE_CMAP, linewidths=0.6, linecolor="white",
+                vmin=np.floor(pivot.min().min()), vmax=np.ceil(pivot.max().max()),
+                cbar_kws={"label": "Share (%)", "shrink": 0.8},
+                annot_kws={"size": 9, "weight": "bold"}, ax=ax)
+    ax.set_title(title, fontsize=15, weight="bold", pad=18)
+    ax.set_xlabel("Weekday"); ax.set_ylabel("Retail Brand")
+    ax.tick_params(axis="x", rotation=0)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    plt.tight_layout(); plt.show()
+
+for segment in df_analysis["Segment"].dropna().unique():
+    summary = weekday_impact(df_analysis[df_analysis["Segment"] == segment])
+    plot_weekday_heatmap(summary, f"{segment} — Order Share (%) by Retail Brand and Weekday")
+
+# %% Average lift by weekday (useful for forecasting)
+weekday_lift = (
+    df_analysis.groupby(["Segment", "retail_brand", "weekday"])
+    .agg(avg_lift_pct=("incremental_lift_pct", "mean"))
+    .round(2)
+    .reset_index()
+)
+
+# %% [markdown]
+# ## Site clustering
+# Features: volume (mm28), maturity, inactivity, booking conversion and attendance.
+# Runs on the full dataset and by segment using the same function.
+
+# %% Reusable clustering function
+CLUSTER_FEATURES = ["mm28", "site_age_days", "inactivity_rate_28", "booking_conversion_rate", "attendance_rate"]
+
+def cluster_sites(df, title, target_k=3):
+    df_sites = (
+        df.groupby(["site_id", "site_name", "retail_brand"])[CLUSTER_FEATURES]
+        .mean()
+        .reset_index()
+        .replace([np.inf, -np.inf], np.nan)
+    )
+    df_sites["inactivity_rate_28"] = df_sites["inactivity_rate_28"].fillna(0)
+    for c in CLUSTER_FEATURES:
+        df_sites[c] = df_sites[c].fillna(df_sites[c].median())
+
+    X = RobustScaler().fit_transform(df_sites[CLUSTER_FEATURES])
+
+    K_RANGE = range(2, 6)
+    silhouette_scores = []
+    for k in K_RANGE:
+        labels = KMeans(n_clusters=k, random_state=42, n_init=10).fit_predict(X)
+        silhouette_scores.append(silhouette_score(X, labels))
+    best_k = list(K_RANGE)[int(np.argmax(silhouette_scores))]
+    print(f"[{title}] Best K by silhouette: {best_k} (score={max(silhouette_scores):.3f}) — using target_k={target_k}")
+
+    km_final = KMeans(n_clusters=target_k, random_state=42, n_init=10)
+    df_sites["cluster"] = km_final.fit_predict(X)
+
+    cluster_profile = df_sites.groupby("cluster")[CLUSTER_FEATURES].mean().round(3)
+    profile_norm = (cluster_profile - cluster_profile.min()) / (cluster_profile.max() - cluster_profile.min())
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    sns.heatmap(profile_norm.T, annot=cluster_profile.T, fmt=".2f", cmap="RdYlGn", linewidths=0.5,
+                cbar_kws={"label": "normalized value (0-1 per feature)"}, ax=ax)
+    ax.set_title(f"{title} — Average Cluster Profile")
+    ax.set_xlabel("Cluster"); ax.set_ylabel("Feature")
+    plt.tight_layout(); plt.show()
+
+    pca = PCA(n_components=3, random_state=42)
+    coords = pca.fit_transform(X)
+    var = pca.explained_variance_ratio_ * 100
+    df_sites[["pca_1", "pca_2", "pca_3"]] = coords
+
+    colors = ["#1b9e77", "#d95f02", "#7570b3", "#e7298a", "#66a61e"]
+    traces = []
+    for c in sorted(df_sites["cluster"].unique()):
+        sub = df_sites[df_sites["cluster"] == c]
+        hover = (
+            sub["site_name"].astype(str) + " (" + sub["retail_brand"].astype(str) + ")"
+            + "<br>volume(mm28): " + sub["mm28"].round(1).astype(str)
+            + "<br>site age: " + sub["site_age_days"].round(0).astype(str) + " days"
+            + "<br>inactivity: " + sub["inactivity_rate_28"].round(2).astype(str)
+        )
+        traces.append(go.Scatter3d(
+            x=sub["pca_1"], y=sub["pca_2"], z=sub["pca_3"], mode="markers",
+            name=f"Cluster {c} (n={len(sub)})",
+            marker=dict(size=4, color=colors[c % len(colors)], opacity=0.8,
+                        line=dict(width=0.5, color="white")),
+            text=hover, hoverinfo="text",
+        ))
+
+    fig3d = go.Figure(data=traces)
+    fig3d.update_layout(
+        title=dict(text=f"{title} — Site Clusters (PCA 3D, {var[:3].sum():.0f}% explained variance)", x=0.5),
+        scene=dict(xaxis_title=f"PC1 ({var[0]:.0f}%)", yaxis_title=f"PC2 ({var[1]:.0f}%)",
+                   zaxis_title=f"PC3 ({var[2]:.0f}%)"),
+        width=950, height=720, legend=dict(itemsizing="constant"),
+    )
+    fig3d.write_html(f"cluster_pca_3d_{title.lower().replace(' ', '_')}.html",
+                      include_plotlyjs="cdn", auto_play=False)
+    fig3d.show()
+
+    return df_sites
+
+# %% Run clustering — overall and by segment
+overall_clusters = cluster_sites(df_order_features, "Overall")
+
+for segment in df_order_features["Segment"].dropna().unique():
+    cluster_sites(df_order_features[df_order_features["Segment"] == segment], segment)
+
+# %% [markdown]
+# ## Next pipeline steps (placeholders)
+# - Feature selection for modeling
+# - Backtesting
+# - Forecast
+# - Deployment / dashboard
+
+# %% Export
+# df_order_features.to_excel(BASE_DIR / "df_order_features.xlsx", index=False)
+# df_order_features.to_csv(BASE_DIR / "df_order_features.csv", index=False, sep=";", encoding="utf-8-sig")
